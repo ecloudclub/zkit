@@ -1,9 +1,12 @@
 package authn
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -11,6 +14,11 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
+
+	"github.com/ecloudclub/zkit/auth/authn/proto/hello"
 )
 
 type User struct {
@@ -18,11 +26,11 @@ type User struct {
 	Name string
 }
 
-func (m *JWTMiddleware) SetTokenLookup(lookup string) {
-	m.config.TokenLookup = lookup
+func (h *JWTHandler) SetTokenLookup(lookup string) {
+	h.config.TokenLookup = lookup
 }
 
-func TestJWT_MultipleLocations(t *testing.T) {
+func TestGINJWT_MultipleLocations(t *testing.T) {
 	// 公共配置
 	cfg := &Config{
 		SecretKey: []byte("gE1cK7kD1pK5aV9jT6fA6nV4dQ7zO1cT"),
@@ -170,4 +178,103 @@ func TestJWT_MultipleLocations(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestGRPCJWT(t *testing.T) {
+	cfg := &Config{
+		SecretKey: []byte("gE1cK7kD1pK5aV9jT6fA6nV4dQ7zO1cT"),
+		PayloadFunc: func(data interface{}) MapClaims {
+			if v, ok := data.(*User); ok {
+				return MapClaims{
+					"id":   v.Id,
+					"name": v.Name,
+				}
+			}
+			return MapClaims{}
+		},
+	}
+
+	handler, err := New(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create JWT handler: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go startServer(ctx, handler)
+
+	if err := waitForServerReady(":8083", 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("client test", func(t *testing.T) {
+		token, err := handler.GenerateToken(&User{Id: 1, Name: "frank"})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		md := metadata.Pairs("authorization", "Bearer "+token)
+		ctx := metadata.NewOutgoingContext(context.Background(), md)
+
+		res, err := hello.NewHelloServiceClient(getClientConn()).Hello(ctx, &hello.HelloRequest{Msg: "Hello World"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Log(res)
+	})
+}
+
+func startServer(ctx context.Context, h *JWTHandler) {
+	server := grpc.NewServer()
+	hello.RegisterHelloServiceServer(server, &HelloServer{handler: h})
+
+	lis, err := net.Listen("tcp", ":8083")
+	if err != nil {
+		panic(err)
+	}
+
+	go func() {
+		<-ctx.Done()
+		server.GracefulStop() // 收到终止信号后优雅关闭
+	}()
+
+	if err := server.Serve(lis); err != nil {
+		log.Printf("Server exited: %v", err)
+	}
+}
+
+type HelloServer struct {
+	hello.UnimplementedHelloServiceServer
+	handler *JWTHandler
+}
+
+func (s *HelloServer) Hello(ctx context.Context, req *hello.HelloRequest) (*hello.HelloResponse, error) {
+	token, err := s.handler.ParseToken(ctx)
+	if err != nil {
+		return nil, err
+	}
+	fmt.Println(token)
+	return &hello.HelloResponse{Msg: req.GetMsg()}, nil
+}
+
+func getClientConn() grpc.ClientConnInterface {
+	cc, err := grpc.NewClient(":8083", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		panic(err)
+	}
+
+	return cc
+}
+
+func waitForServerReady(address string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", address, time.Second)
+		if err == nil {
+			conn.Close()
+			return nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return fmt.Errorf("server not ready in %v", timeout)
 }

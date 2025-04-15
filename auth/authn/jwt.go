@@ -1,8 +1,12 @@
 package authn
 
 import (
+	"context"
 	"crypto/rsa"
 	"errors"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 	"os"
 	"strings"
 	"time"
@@ -18,6 +22,8 @@ const (
 	defaultTimeout          = time.Hour
 	defaultTokenHeadName    = "Bearer"
 	defaultRealm            = "zkit jwt"
+
+	headerAuthorize = "authorization"
 )
 
 var (
@@ -51,7 +57,7 @@ var (
 // This is the default claims type if you don't supply one
 type MapClaims map[string]interface{}
 
-type JWTMiddleware struct {
+type JWTHandler struct {
 	config *Config
 }
 
@@ -123,8 +129,8 @@ type Config struct {
 	ParseOptions []jwt.ParserOption
 }
 
-func New(cfg *Config) (*JWTMiddleware, error) {
-	mw := &JWTMiddleware{config: cfg}
+func New(cfg *Config) (*JWTHandler, error) {
+	mw := &JWTHandler{config: cfg}
 
 	if err := mw.InitConfig(); err != nil {
 		return nil, err
@@ -133,57 +139,57 @@ func New(cfg *Config) (*JWTMiddleware, error) {
 	return mw, nil
 }
 
-func (m *JWTMiddleware) InitConfig() error {
-	if m.config.TokenLookup == "" {
-		m.config.TokenLookup = defaultTokenLookUp
+func (h *JWTHandler) InitConfig() error {
+	if h.config.TokenLookup == "" {
+		h.config.TokenLookup = defaultTokenLookUp
 	}
 
-	if m.config.SigningAlgorithm == "" {
-		m.config.SigningAlgorithm = defaultSigningAlgorithm
+	if h.config.SigningAlgorithm == "" {
+		h.config.SigningAlgorithm = defaultSigningAlgorithm
 	}
 
-	if m.config.Timeout == 0 {
-		m.config.Timeout = defaultTimeout
+	if h.config.Timeout == 0 {
+		h.config.Timeout = defaultTimeout
 	}
 
-	m.config.TokenHeadName = strings.TrimSpace(m.config.TokenHeadName)
-	if m.config.TokenHeadName == "" {
-		m.config.TokenHeadName = defaultTokenHeadName
+	h.config.TokenHeadName = strings.TrimSpace(h.config.TokenHeadName)
+	if h.config.TokenHeadName == "" {
+		h.config.TokenHeadName = defaultTokenHeadName
 	}
 
-	if m.config.Realm == "" {
-		m.config.Realm = defaultRealm
+	if h.config.Realm == "" {
+		h.config.Realm = defaultRealm
 	}
 
-	if m.config.KeyFunc != nil {
+	if h.config.KeyFunc != nil {
 		// bypass other key settings if KeyFunc is set
 		return nil
 	}
 
-	if m.usingPublicKeyAlgo() {
-		return m.readKeys()
+	if h.usingPublicKeyAlgo() {
+		return h.readKeys()
 	}
 
-	if m.config.SecretKey == nil {
+	if h.config.SecretKey == nil {
 		return ErrMissingSecretKey
 	}
 
 	return nil
 }
 
-func (m *JWTMiddleware) GenerateToken(data any) (string, error) {
+func (h *JWTHandler) GenerateToken(data any) (string, error) {
 	claims := jwt.MapClaims{}
-	if m.config.PayloadFunc != nil {
-		for key, value := range m.config.PayloadFunc(data) {
+	if h.config.PayloadFunc != nil {
+		for key, value := range h.config.PayloadFunc(data) {
 			claims[key] = value
 		}
 	}
-	expire := time.Now().UTC().Add(m.config.Timeout)
+	expire := time.Now().UTC().Add(h.config.Timeout)
 	claims["expire"] = expire.Unix()
 	claims["orig_iat"] = time.Now().Unix()
 
-	token := jwt.NewWithClaims(jwt.GetSigningMethod(m.config.SigningAlgorithm), claims)
-	tokenStr, err := m.signedString(token)
+	token := jwt.NewWithClaims(jwt.GetSigningMethod(h.config.SigningAlgorithm), claims)
+	tokenStr, err := h.signedString(token)
 	if err != nil {
 		return "", err
 	}
@@ -191,62 +197,162 @@ func (m *JWTMiddleware) GenerateToken(data any) (string, error) {
 	return tokenStr, nil
 }
 
-func (m *JWTMiddleware) signedString(token *jwt.Token) (string, error) {
+func (h *JWTHandler) signedString(token *jwt.Token) (string, error) {
 	var tokenStr string
 	var err error
-	if m.usingPublicKeyAlgo() {
-		tokenStr, err = token.SignedString(m.config.priKey)
+	if h.usingPublicKeyAlgo() {
+		tokenStr, err = token.SignedString(h.config.priKey)
 	} else {
-		tokenStr, err = token.SignedString(m.config.SecretKey)
+		tokenStr, err = token.SignedString(h.config.SecretKey)
 	}
 
 	return tokenStr, err
 }
 
-func (m *JWTMiddleware) ParseToken(c *gin.Context) (*jwt.Token, error) {
+func (h *JWTHandler) ParseToken(ctx context.Context) (*jwt.Token, error) {
 	var token string
 	var err error
-
-	parts := strings.Split(strings.TrimSpace(m.config.TokenLookup), ":")
-	k := strings.TrimSpace(parts[0])
-	v := strings.TrimSpace(parts[1])
-
-	switch k {
-	case "header":
-		token, err = m.jwtFromHeader(c, v)
-	case "cookie":
-		token, err = m.jwtFromCookie(c, v)
-	case "query":
-		token, err = m.jwtFromQuery(c, v)
-	case "param":
-		token, err = m.jwtFromParam(c, v)
-	case "form":
-		token, err = m.jwtFromForm(c, v)
+	switch c := ctx.(type) {
+	case *gin.Context:
+		token, err = h.getGinToken(c)
+	default:
+		token, err = h.getGRPCToken(c, "Bearer")
 	}
 	if err != nil {
 		return nil, err
 	}
 
-	if m.config.KeyFunc != nil {
-		return jwt.Parse(token, m.config.KeyFunc, m.config.ParseOptions...)
+	if h.config.KeyFunc != nil {
+		return jwt.Parse(token, h.config.KeyFunc, h.config.ParseOptions...)
 	}
 
 	return jwt.Parse(token, func(token *jwt.Token) (interface{}, error) {
-		if jwt.GetSigningMethod(m.config.SigningAlgorithm) != token.Method {
+		if jwt.GetSigningMethod(h.config.SigningAlgorithm) != token.Method {
 			return nil, ErrInvalidSigningAlgorithm
 		}
-		if m.usingPublicKeyAlgo() {
-			return m.config.pubKey, nil
+		if h.usingPublicKeyAlgo() {
+			return h.config.pubKey, nil
 		}
 
-		// save token string if valid
-		c.Set("JWT_TOKEN", token)
-
-		return m.config.SecretKey, nil
-	}, m.config.ParseOptions...)
+		return h.config.SecretKey, nil
+	}, h.config.ParseOptions...)
 }
 
-func (m *JWTMiddleware) jwtFromHeader(c *gin.Context, key string) (string, error) {
+func (h *JWTHandler) getGinToken(c *gin.Context) (string, error) {
+	var token string
+	var err error
+
+	parts := strings.Split(strings.TrimSpace(h.config.TokenLookup), ":")
+	k := strings.TrimSpace(parts[0])
+	v := strings.TrimSpace(parts[1])
+
+	switch k {
+	case "header":
+		token, err = h.jwtFromHeader(c, v)
+	case "cookie":
+		token, err = h.jwtFromCookie(c, v)
+	case "query":
+		token, err = h.jwtFromQuery(c, v)
+	case "param":
+		token, err = h.jwtFromParam(c, v)
+	case "form":
+		token, err = h.jwtFromForm(c, v)
+	}
+
+	return token, err
+}
+
+func (h *JWTHandler) getGRPCToken(ctx context.Context, expectedScheme string) (string, error) {
+	vals := metadata.ValueFromIncomingContext(ctx, headerAuthorize)
+	if len(vals) == 0 {
+		return "", status.Error(codes.Unauthenticated, "Request unauthenticated with "+expectedScheme)
+	}
+	scheme, token, found := strings.Cut(vals[0], " ")
+	if !found {
+		return "", status.Error(codes.Unauthenticated, "Bad authorization string")
+	}
+	if !strings.EqualFold(scheme, expectedScheme) {
+		return "", status.Error(codes.Unauthenticated, "Request unauthenticated with "+expectedScheme)
+	}
+	return token, nil
+}
+
+func (h *JWTHandler) readKeys() error {
+	err := h.privateKey()
+	if err != nil {
+		return err
+	}
+	err = h.publicKey()
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (h *JWTHandler) privateKey() error {
+	var keyData []byte
+	if h.config.PriKeyFile == "" {
+		keyData = h.config.PriKeyBytes
+	} else {
+		content, err := os.ReadFile(h.config.PriKeyFile)
+		if err != nil {
+			return ErrNoPriKeyFile
+		}
+		keyData = content
+	}
+
+	if h.config.PrivateKeyPassphrase != "" {
+		key, err := pkcs8.ParsePKCS8PrivateKey(keyData, []byte(h.config.PrivateKeyPassphrase))
+		if err != nil {
+			return ErrInvalidPriKey
+		}
+
+		rsaKey, ok := key.(*rsa.PrivateKey)
+		if !ok {
+			return ErrInvalidPriKey
+		}
+
+		h.config.priKey = rsaKey
+		return nil
+	}
+
+	key, err := jwt.ParseRSAPrivateKeyFromPEM(keyData)
+	if err != nil {
+		return ErrInvalidPriKey
+	}
+	h.config.priKey = key
+	return nil
+}
+
+func (h *JWTHandler) publicKey() error {
+	var keyData []byte
+	if h.config.PubKeyFile == "" {
+		keyData = h.config.PubKeyBytes
+	} else {
+		content, err := os.ReadFile(h.config.PubKeyFile)
+		if err != nil {
+			return ErrNoPubKeyFile
+		}
+		keyData = content
+	}
+
+	key, err := jwt.ParseRSAPublicKeyFromPEM(keyData)
+	if err != nil {
+		return ErrInvalidPubKey
+	}
+	h.config.pubKey = key
+	return nil
+}
+
+func (h *JWTHandler) usingPublicKeyAlgo() bool {
+	switch h.config.SigningAlgorithm {
+	case "RS256", "RS512", "RS384":
+		return true
+	}
+	return false
+}
+
+func (h *JWTHandler) jwtFromHeader(c *gin.Context, key string) (string, error) {
 	authHeader := c.Request.Header.Get(key)
 
 	if authHeader == "" {
@@ -254,14 +360,14 @@ func (m *JWTMiddleware) jwtFromHeader(c *gin.Context, key string) (string, error
 	}
 
 	parts := strings.SplitN(authHeader, " ", 2)
-	if !(len(parts) == 2 && parts[0] == m.config.TokenHeadName) {
+	if !(len(parts) == 2 && parts[0] == h.config.TokenHeadName) {
 		return "", ErrInvalidAuthHeader
 	}
 
 	return parts[len(parts)-1], nil
 }
 
-func (m *JWTMiddleware) jwtFromQuery(c *gin.Context, key string) (string, error) {
+func (h *JWTHandler) jwtFromQuery(c *gin.Context, key string) (string, error) {
 	token := c.Query(key)
 
 	if token == "" {
@@ -271,7 +377,7 @@ func (m *JWTMiddleware) jwtFromQuery(c *gin.Context, key string) (string, error)
 	return token, nil
 }
 
-func (m *JWTMiddleware) jwtFromCookie(c *gin.Context, key string) (string, error) {
+func (h *JWTHandler) jwtFromCookie(c *gin.Context, key string) (string, error) {
 	cookie, err := c.Cookie(key)
 	if err != nil {
 		return "", err
@@ -284,7 +390,7 @@ func (m *JWTMiddleware) jwtFromCookie(c *gin.Context, key string) (string, error
 	return cookie, nil
 }
 
-func (m *JWTMiddleware) jwtFromParam(c *gin.Context, key string) (string, error) {
+func (h *JWTHandler) jwtFromParam(c *gin.Context, key string) (string, error) {
 	token := c.Param(key)
 
 	if token == "" {
@@ -294,7 +400,7 @@ func (m *JWTMiddleware) jwtFromParam(c *gin.Context, key string) (string, error)
 	return token, nil
 }
 
-func (m *JWTMiddleware) jwtFromForm(c *gin.Context, key string) (string, error) {
+func (h *JWTHandler) jwtFromForm(c *gin.Context, key string) (string, error) {
 	token := c.PostForm(key)
 
 	if token == "" {
@@ -302,79 +408,4 @@ func (m *JWTMiddleware) jwtFromForm(c *gin.Context, key string) (string, error) 
 	}
 
 	return token, nil
-}
-
-func (m *JWTMiddleware) readKeys() error {
-	err := m.privateKey()
-	if err != nil {
-		return err
-	}
-	err = m.publicKey()
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-func (m *JWTMiddleware) privateKey() error {
-	var keyData []byte
-	if m.config.PriKeyFile == "" {
-		keyData = m.config.PriKeyBytes
-	} else {
-		content, err := os.ReadFile(m.config.PriKeyFile)
-		if err != nil {
-			return ErrNoPriKeyFile
-		}
-		keyData = content
-	}
-
-	if m.config.PrivateKeyPassphrase != "" {
-		key, err := pkcs8.ParsePKCS8PrivateKey(keyData, []byte(m.config.PrivateKeyPassphrase))
-		if err != nil {
-			return ErrInvalidPriKey
-		}
-
-		rsaKey, ok := key.(*rsa.PrivateKey)
-		if !ok {
-			return ErrInvalidPriKey
-		}
-
-		m.config.priKey = rsaKey
-		return nil
-	}
-
-	key, err := jwt.ParseRSAPrivateKeyFromPEM(keyData)
-	if err != nil {
-		return ErrInvalidPriKey
-	}
-	m.config.priKey = key
-	return nil
-}
-
-func (m *JWTMiddleware) publicKey() error {
-	var keyData []byte
-	if m.config.PubKeyFile == "" {
-		keyData = m.config.PubKeyBytes
-	} else {
-		content, err := os.ReadFile(m.config.PubKeyFile)
-		if err != nil {
-			return ErrNoPubKeyFile
-		}
-		keyData = content
-	}
-
-	key, err := jwt.ParseRSAPublicKeyFromPEM(keyData)
-	if err != nil {
-		return ErrInvalidPubKey
-	}
-	m.config.pubKey = key
-	return nil
-}
-
-func (m *JWTMiddleware) usingPublicKeyAlgo() bool {
-	switch m.config.SigningAlgorithm {
-	case "RS256", "RS512", "RS384":
-		return true
-	}
-	return false
 }
