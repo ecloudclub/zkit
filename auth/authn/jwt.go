@@ -4,9 +4,6 @@ import (
 	"context"
 	"crypto/rsa"
 	"errors"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/metadata"
-	"google.golang.org/grpc/status"
 	"os"
 	"strings"
 	"time"
@@ -14,6 +11,9 @@ import (
 	"github.com/elastic/pkcs8"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 const (
@@ -27,6 +27,8 @@ const (
 )
 
 var (
+	// ErrExpiredToken indicates JWT token has expired. Can't refresh.
+	ErrExpiredToken = errors.New("token is expired") // in practice, this is generated from the jwt library not by us
 	// ErrMissingSecretKey indicates Secret key is required
 	ErrMissingSecretKey = errors.New("secret key is required")
 	// ErrEmptyAuthHeader can be thrown if authing with an HTTP header, the Auth header needs to be set
@@ -78,6 +80,12 @@ type Config struct {
 
 	// Duration that a jwt token is valid. Optional, defaults to one hour.
 	Timeout time.Duration
+
+	// This field allows clients to refresh their token until MaxRefresh has passed.
+	// Note that clients can refresh their token in the last moment of MaxRefresh.
+	// This means that the maximum validity timespan for a token is TokenTime + MaxRefresh.
+	// Optional, defaults to 0 meaning not refreshable.
+	MaxRefresh time.Duration
 
 	// Callback function that will be called during login.
 	// Using this function, it is possible to add additional payload data to the webtoken.
@@ -236,6 +244,43 @@ func (h *JWTHandler) ParseToken(ctx context.Context) (*jwt.Token, error) {
 
 		return h.config.SecretKey, nil
 	}, h.config.ParseOptions...)
+}
+
+func (h *JWTHandler) CheckExpire(ctx context.Context) (jwt.MapClaims, error) {
+	token, err := h.ParseToken(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	claims := token.Claims.(jwt.MapClaims)
+
+	origIat := int64(claims["orig_iat"].(float64))
+
+	if origIat < time.Now().Add(-h.config.MaxRefresh).Unix() {
+		return nil, ErrExpiredToken
+	}
+
+	return claims, nil
+}
+
+func (h *JWTHandler) RefreshToken(ctx context.Context) (string, error) {
+	claims, err := h.CheckExpire(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	// create new token
+	newClaims := make(jwt.MapClaims, len(claims))
+	for k, v := range claims {
+		newClaims[k] = v
+	}
+	expire := time.Now().UTC().Add(h.config.Timeout)
+	newClaims["expire"] = expire.Unix()
+	newClaims["orig_iat"] = time.Now().Unix()
+	newToken := jwt.NewWithClaims(jwt.GetSigningMethod(h.config.SigningAlgorithm), newClaims)
+	tokenStr, err := h.signedString(newToken)
+
+	return tokenStr, err
 }
 
 func (h *JWTHandler) getGinToken(c *gin.Context) (string, error) {
