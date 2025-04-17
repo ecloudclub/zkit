@@ -1,6 +1,8 @@
 package zapx
 
-import "go.uber.org/zap"
+import (
+	"go.uber.org/zap/zapcore"
+)
 
 type CustomCore struct {
 	zapcore.Core
